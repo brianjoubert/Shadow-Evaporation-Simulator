@@ -1,6 +1,6 @@
-import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import polygonClipping from "polygon-clipping";
+import * as THREE from "./vendor/three.module.min.js";
+import { OrbitControls } from "./vendor/OrbitControls.js";
+import polygonClipping from "./vendor/polygon-clipping.esm.js";
 import { parseGdsBinary, writeGdsBinary } from "./gds.js";
 
 // Color palette per group

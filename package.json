@@ -35,10 +35,10 @@
       "main.js",
       "preload.js",
       "src/**/*",
-      "node_modules/**/*",
       "package.json"
     ],
     "win": {
+      "signAndEditExecutable": false,
       "target": [
         "portable"
       ],
