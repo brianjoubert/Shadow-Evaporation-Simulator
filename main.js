@@ -19,6 +19,21 @@ function createWindow() {
   });
 
   win.loadFile(path.join(__dirname, "src", "index.html"));
+
+  if (process.argv.includes("--smoke-test")) {
+    win.webContents.on("console-message", (_e, level, msg, line, src) => {
+      console.log(`CONSOLE [${level}]: ${msg} (${src}:${line})`);
+    });
+    win.webContents.on("did-finish-load", () => {
+      setTimeout(async () => {
+        const metrics = await win.webContents.executeJavaScript(
+          'document.getElementById("metricsBox").textContent'
+        );
+        console.log("METRICS_OUT:\n" + metrics);
+        app.quit();
+      }, 600);
+    });
+  }
 }
 
 ipcMain.handle("dialog:openGds", async () => {

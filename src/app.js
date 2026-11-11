@@ -1,7 +1,94 @@
 import * as THREE from "./vendor/three.module.min.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
-import polygonClipping from "./vendor/polygon-clipping.esm.js";
+import ClipperLib from "./vendor/clipper.esm.js";
 import { parseGdsBinary, writeGdsBinary } from "./gds.js";
+
+const CLIP_SCALE = 100.0;
+
+function multiPolyToPaths(mp) {
+  const paths = [];
+  if (!mp) return paths;
+  for (const poly of mp) {
+    for (let r = 0; r < poly.length; r++) {
+      const ring = poly[r];
+      if (!ring || ring.length < 3) continue;
+      const path = ring.map(([x, y]) => ({
+        X: Math.round(x * CLIP_SCALE),
+        Y: Math.round(y * CLIP_SCALE),
+      }));
+      const orient = ClipperLib.Clipper.Orientation(path);
+      if (r === 0 && !orient) path.reverse();
+      if (r > 0 && orient) path.reverse();
+      paths.push(path);
+    }
+  }
+  return paths;
+}
+
+function polyTreeToMultiPoly(polyTree) {
+  const result = [];
+  function visitNode(node) {
+    const contour = node.Contour ? node.Contour() : [];
+    if (contour.length >= 3 && !node.IsHole()) {
+      const outer = contour.map((pt) => [pt.X / CLIP_SCALE, pt.Y / CLIP_SCALE]);
+      const poly = [outer];
+      const children = node.Childs();
+      for (let i = 0; i < children.length; i++) {
+        const holeNode = children[i];
+        const hContour = holeNode.Contour();
+        if (hContour.length >= 3) {
+          poly.push(hContour.map((pt) => [pt.X / CLIP_SCALE, pt.Y / CLIP_SCALE]));
+        }
+        const grandChildren = holeNode.Childs();
+        for (let j = 0; j < grandChildren.length; j++) {
+          visitNode(grandChildren[j]);
+        }
+      }
+      result.push(poly);
+    } else {
+      const children = node.Childs();
+      for (let i = 0; i < children.length; i++) {
+        visitNode(children[i]);
+      }
+    }
+  }
+  visitNode(polyTree);
+  return result;
+}
+
+function clipOp(clipType, subjMP, clipMP = null) {
+  const c = new ClipperLib.Clipper();
+  const sPaths = multiPolyToPaths(subjMP);
+  if (sPaths.length === 0) return [];
+  c.AddPaths(sPaths, ClipperLib.PolyType.ptSubject, true);
+  if (clipMP) {
+    const cPaths = multiPolyToPaths(clipMP);
+    if (cPaths.length === 0) {
+      return clipType === ClipperLib.ClipType.ctIntersection ? [] : subjMP;
+    }
+    c.AddPaths(cPaths, ClipperLib.PolyType.ptClip, true);
+  }
+  const tree = new ClipperLib.PolyTree();
+  c.Execute(
+    clipType,
+    tree,
+    ClipperLib.PolyFillType.pftNonZero,
+    ClipperLib.PolyFillType.pftNonZero
+  );
+  return polyTreeToMultiPoly(tree);
+}
+
+const polygonClipping = {
+  union: (...mps) => {
+    const combined = [];
+    for (const mp of mps) {
+      if (mp && mp.length > 0) combined.push(...mp);
+    }
+    return clipOp(ClipperLib.ClipType.ctUnion, combined, null);
+  },
+  intersection: (a, b) => clipOp(ClipperLib.ClipType.ctIntersection, a, b),
+  difference: (a, b) => clipOp(ClipperLib.ClipType.ctDifference, a, b),
+};
 
 // Color palette per group
 const GROUP_PALETTE = {
@@ -84,64 +171,24 @@ function multiPolyBounds(multiPoly) {
   return { minX, minY, maxX, maxY };
 }
 
-/**
- * Positive buffer (expansion) of a MultiPolygon by `radius` nm using Minkowski sum
- * of edges (rectangles) and vertices (12-gon disks), merged via polygonClipping.union.
- */
 function expandMultiPolygon(multiPoly, radius) {
   if (radius <= 0 || !multiPoly || multiPoly.length === 0) return multiPoly;
-  const pieces = [...multiPoly.map((p) => [p[0]])];
-  const nArc = 12;
-
-  for (const poly of multiPoly) {
-    const ring = poly[0];
-    if (!ring || ring.length < 3) continue;
-    // Strip duplicate closing vertex if present
-    const pts =
-      Math.hypot(ring[0][0] - ring[ring.length - 1][0], ring[0][1] - ring[ring.length - 1][1]) < 1e-6
-        ? ring.slice(0, -1)
-        : ring;
-
-    for (let i = 0; i < pts.length; i++) {
-      const [x1, y1] = pts[i];
-      const [x2, y2] = pts[(i + 1) % pts.length];
-      const dx = x2 - x1;
-      const dy = y2 - y1;
-      const len = Math.hypot(dx, dy);
-      if (len > 1e-6) {
-        const nx = (-dy / len) * radius;
-        const ny = (dx / len) * radius;
-        pieces.push([
-          [
-            [x1 + nx, y1 + ny],
-            [x2 + nx, y2 + ny],
-            [x2 - nx, y2 - ny],
-            [x1 - nx, y1 - ny],
-          ],
-        ]);
-      }
-      const disk = [];
-      for (let k = 0; k < nArc; k++) {
-        const ang = (2 * Math.PI * k) / nArc;
-        disk.push([x1 + radius * Math.cos(ang), y1 + radius * Math.sin(ang)]);
-      }
-      pieces.push([disk]);
-    }
-  }
-  return polygonClipping.union(...pieces);
+  const co = new ClipperLib.ClipperOffset(2.0, 4.0 * CLIP_SCALE);
+  const paths = multiPolyToPaths(multiPoly);
+  co.AddPaths(paths, ClipperLib.JoinType.jtRound, ClipperLib.EndType.etClosedPolygon);
+  const tree = new ClipperLib.PolyTree();
+  co.Execute(tree, radius * CLIP_SCALE);
+  return polyTreeToMultiPoly(tree);
 }
 
-/**
- * Negative buffer (erosion / mask clogging) by `radius` nm.
- */
 function erodeMultiPolygon(multiPoly, radius) {
   if (radius <= 0 || !multiPoly || multiPoly.length === 0) return multiPoly;
-  const b = multiPolyBounds(multiPoly);
-  const pad = radius * 4 + 500;
-  const outer = [[makeBoxRing(b.minX - pad, b.minY - pad, b.maxX + pad, b.maxY + pad)]];
-  const complement = polygonClipping.difference(outer, multiPoly);
-  const expandedComp = expandMultiPolygon(complement, radius);
-  return polygonClipping.difference(multiPoly, expandedComp);
+  const co = new ClipperLib.ClipperOffset(2.0, 4.0 * CLIP_SCALE);
+  const paths = multiPolyToPaths(multiPoly);
+  co.AddPaths(paths, ClipperLib.JoinType.jtMiter, ClipperLib.EndType.etClosedPolygon);
+  const tree = new ClipperLib.PolyTree();
+  co.Execute(tree, -radius * CLIP_SCALE);
+  return polyTreeToMultiPoly(tree);
 }
 
 /**
@@ -428,7 +475,7 @@ function runSimulation() {
   const clogging = document.getElementById("chkClogging").checked;
 
   // 1. Union input GDS polygons into topMask
-  const inputPolys = state.rawPolygons.map((ring) => [ring]);
+  const inputPolys = state.rawPolygons.map((ring) => [[ring]]);
   const topMask = polygonClipping.union(...inputPolys);
   const cavity = expandMultiPolygon(topMask, undercut);
 
