@@ -18,7 +18,7 @@
     "threejs",
     "electron"
   ],
-  "author": "Fabien Lafont",
+  "author": "Fabien Lafont <lafont.fabien@gmail.com>",
   "license": "MIT",
   "dependencies": {
     "polygon-clipping": "^0.15.7",
