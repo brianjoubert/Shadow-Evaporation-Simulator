@@ -1,0 +1,58 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build single-file .exe with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onefile --windowed `
+            --name Shadow_Evaporation_Simulator `
+            --collect-data trimesh `
+            --collect-submodules trimesh `
+            --hidden-import mapbox_earcut `
+            --collect-all gdstk `
+            --collect-all shapely `
+            Shadow_Evaporation_Simulator.py
+
+      - name: Upload .exe as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shadow_Evaporation_Simulator-Windows-x64
+          path: dist/Shadow_Evaporation_Simulator.exe
+          if-no-files-found: error
+
+      - name: Publish .exe to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Windows Executable Build
+          body: "Automated build of `Shadow_Evaporation_Simulator.exe` from commit ${{ github.sha }}."
+          prerelease: false
+          files: dist/Shadow_Evaporation_Simulator.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

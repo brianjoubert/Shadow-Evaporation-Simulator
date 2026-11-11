@@ -1,0 +1,13 @@
+# Ignore build & cache directories
+__pycache__/
+build/
+dist/
+*.spec
+*.pyc
+*.html
+
+# Ignore unrelated files in this directory
+Baking_DR1.py
+Israel_Quantum_Ecosystem.pptx
+Resistance_Monitor_Simple.py
+vna_multi_window_measure.py
