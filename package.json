@@ -1,0 +1,56 @@
+{
+  "name": "shadow-evaporation-simulator",
+  "version": "2.0.0",
+  "description": "3D WebGL Manhattan Shadow Evaporation Simulator (Electron + Three.js) for Windows and Linux",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win portable",
+    "dist:linux": "electron-builder --linux AppImage deb",
+    "dist:all": "electron-builder -wl"
+  },
+  "keywords": [
+    "josephson-junction",
+    "manhattan",
+    "shadow-evaporation",
+    "superconducting-qubits",
+    "webgl",
+    "threejs",
+    "electron"
+  ],
+  "author": "Fabien Lafont",
+  "license": "MIT",
+  "dependencies": {
+    "polygon-clipping": "^0.15.7",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.qclab.shadow-evaporation-simulator",
+    "productName": "Shadow Evaporation Simulator",
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "artifactName": "Shadow_Evaporation_Simulator-${version}-Windows-x64.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Science",
+      "artifactName": "Shadow_Evaporation_Simulator-${version}-Linux-${arch}.${ext}"
+    }
+  }
+}

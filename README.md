@@ -1,16 +1,26 @@
-# 3D Manhattan Shadow Evaporation Simulator
+# 3D WebGL Manhattan Shadow Evaporation Simulator (Electron + Three.js)
 
-Interactive 3D simulator for multi-angle planetary shadow evaporation of Manhattan Josephson junctions (with and without bandages), including polycrystalline Aluminum grain morphology and conformal step coverage.
+Cross-platform desktop application (**Windows `.exe`** & **Linux `.AppImage` / `.deb`**) for simulating multi-angle planetary shadow evaporation of Manhattan Josephson junctions (with and without bandages), rendered natively in 3D via **WebGL (Three.js)**.
 
 ## Features
-- **Manhattan GDS Layout Support**: Load custom `.gds` files (in `nm` or `µm`) or generate test Manhattan geometries (2-angle without bandages or 3-angle with $45^\circ$ bandages).
-- **Bilayer Resist & Trench Wall Shadowing**: Models both bottom undercut height (`h_bot`), top resist thickness (`t_top`), and lateral undercut cavity expansion.
-- **Unlimited Planetary Evaporation Steps**: Supports arbitrary step sequences, bidirectional pairs ($0^\circ + 180^\circ$, $90^\circ + 270^\circ$, $45^\circ + 225^\circ$), per-step deposition rates, and inter-step oxidation ($\text{AlO}_x$).
-- **Polycrystalline Al Grain Topography & Conformal 3D Stack**: Models rate- and thickness-dependent Al grain size (default $5\text{ nm}$ at $1\text{ nm/s}$) with flush 3D layer stacking, AFM hillshaded top-down view, interactive 3D stack view, vertical cross-section line cuts, and a full-screen Three.js WebGL 3D browser viewer.
-- **Automated Windows `.exe` Build**: GitHub Actions automatically builds `Shadow_Evaporation_Simulator.exe` on every push and publishes it to the repository's **Actions** artifacts and **Releases** page.
+- **Embedded Hardware-Accelerated 3D WebGL Viewport (`Three.js`)**:
+  - Real-time 60 FPS 3D inspection with `OrbitControls`, camera presets (`3D Iso`, `Top XY`, `Front XZ`, `Side YZ`, `Zoom JJ`), translucent top resist mask toggle, undercut cavity outline, wireframe toggle, and vertical $Z$-exaggeration (`1×`, `2×`, `3×`).
+- **Flush Conformal 3D Layer Stacking & Polycrystalline Al Grain Physics (`@ 1 nm/s`)**:
+  - Exact 2D polygonal boolean partitioning (`polygon-clipping`) ensures stacked layers (`Electrode 1`, `Electrode 2`, `Bandage`, and `AlOx` barrier) sit flush at `z_bot` directly on top of underlying layers with zero gaps or diagonal grid-aliasing spikes.
+  - Procedural polycrystalline Voronoi Aluminum grain bump/roughness textures & top-surface micro-relief scaled to nominal grain size (default $5.0\text{ nm}$ at $1\text{ nm/s}$).
+- **Unlimited Planetary Evaporation Steps & Bidirectional ($0^\circ/180^\circ$) Pairs**:
+  - Add, edit, reorder, or remove arbitrary steps; one-click `+ Add 0°/180° Pair` and built-in presets (`2-Step`, `4-Step Bi`, `6-Step Bi + Bandage`).
+- **Native Binary `.gds` Parser & Generator**:
+  - Load custom `.gds` files (in `nm` or `µm`) or generate/export test Manhattan `.gds` layouts.
+- **Live 2D Footprint & Vertical Cross-Section Profile $Z(s)$**:
+  - Interactive line cuts along `X (y = 0)`, `Y (x = 0)`, `Bandage 1 (x = 2900 nm)`, and `Bandage 2 (y = 2150 nm)`.
 
-## Running from Source
+## Running Locally (Windows, Linux, macOS)
 ```bash
-pip install -r requirements.txt
-python Shadow_Evaporation_Simulator.py
+npm install
+npm start
 ```
+
+## Building Standalone Desktop Binaries
+- **Windows (`.exe`)**: `npm run dist:win`
+- **Linux (`.AppImage` & `.deb`)**: `npm run dist:linux`
