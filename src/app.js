@@ -102,13 +102,13 @@ const GROUP_PALETTE = {
 const state = {
   rawGdsBytes: null,
   gdsName: "test_manhattan_bandage.gds",
-  rawPolygons: [], // Array of simple rings [[x,y], ...]
+  rawPolygons: [],
   steps: [],
   selectedStepIdx: 0,
   lastSim: null,
 };
 
-// ==================== 2D Polygon Geometry Helpers ====================
+// ==================== 2D Polygon & Analytic Signed-Distance Helpers ====================
 
 function makeBoxRing(minX, minY, maxX, maxY) {
   return [
@@ -193,7 +193,7 @@ function erodeMultiPolygon(multiPoly, radius) {
 
 /**
  * Computes line-of-sight shadow footprint through finite-thickness top resist [hBot, hBot + tTop]
- * intersected with the undercut cavity.
+ * intersected with the undercut cavity, filtering out tiny corner-leakage specks (< 3500 nm²).
  */
 function computeStepShadowFootprint(effectiveMask, cavity, hBot, tTop, tiltDeg, rotDeg, nSlices = 9) {
   const tiltRad = (tiltDeg * Math.PI) / 180.0;
@@ -212,38 +212,69 @@ function computeStepShadowFootprint(effectiveMask, cavity, hBot, tTop, tiltDeg, 
     beam = beam === null ? shifted : polygonClipping.intersection(beam, shifted);
     if (!beam || beam.length === 0) return [];
   }
-  return polygonClipping.intersection(beam, cavity);
+  const raw = polygonClipping.intersection(beam, cavity);
+  // Remove tiny parasitic corner specks (< 3500 nm²)
+  return raw.filter((poly) => poly.length > 0 && Math.abs(ringSignedArea(poly[0])) >= 3500);
 }
 
-function pointInRing(px, py, ring) {
+/**
+ * Exact signed Euclidean distance from (px, py) to a single polygon (outer ring + optional holes).
+ * Positive inside the polygon, negative outside.
+ */
+function signedDistToRing(px, py, ring) {
   let inside = false;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const xi = ring[i][0], yi = ring[i][1];
-    const xj = ring[j][0], yj = ring[j][1];
-    const intersect = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi + 1e-12) + xi;
-    if (intersect) inside = !inside;
-  }
-  return inside;
-}
-
-function pointInMultiPoly(px, py, multiPoly) {
-  for (const poly of multiPoly) {
-    if (poly.length === 0) continue;
-    if (pointInRing(px, py, poly[0])) {
-      let inHole = false;
-      for (let h = 1; h < poly.length; h++) {
-        if (pointInRing(px, py, poly[h])) {
-          inHole = true;
-          break;
-        }
-      }
-      if (!inHole) return true;
+  let minDistSq = Infinity;
+  const n = ring.length;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const x1 = ring[j][0], y1 = ring[j][1];
+    const x2 = ring[i][0], y2 = ring[i][1];
+    if (y2 > py !== y1 > py && px < ((x1 - x2) * (py - y2)) / (y1 - y2 + 1e-12) + x2) {
+      inside = !inside;
     }
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const l2 = dx * dx + dy * dy || 1.0;
+    let t = ((px - x1) * dx + (py - y1) * dy) / l2;
+    if (t < 0.0) t = 0.0;
+    else if (t > 1.0) t = 1.0;
+    const projX = x1 + t * dx;
+    const projY = y1 + t * dy;
+    const dSq = (px - projX) * (px - projX) + (py - projY) * (py - projY);
+    if (dSq < minDistSq) minDistSq = dSq;
   }
-  return false;
+  const d = Math.sqrt(minDistSq);
+  return inside ? d : -d;
 }
 
-// ==================== Deterministic PRNG & Al Grain Bump Map ====================
+function signedDistToMultiPoly(px, py, multiPoly) {
+  let maxDist = -Infinity;
+  for (let p = 0; p < multiPoly.length; p++) {
+    const poly = multiPoly[p];
+    if (!poly || poly.length === 0) continue;
+    let dPoly = signedDistToRing(px, py, poly[0]);
+    for (let h = 1; h < poly.length; h++) {
+      const dHole = signedDistToRing(px, py, poly[h]);
+      if (-dHole < dPoly) dPoly = -dHole;
+    }
+    if (dPoly > maxDist) maxDist = dPoly;
+  }
+  return maxDist;
+}
+
+/**
+ * C2-continuous quintic smoothstep S-curve ramp over [-0.5 * slopeW, +0.5 * slopeW].
+ * Models physical shadow penumbra + adatom surface diffusion slope so step edges
+ * and layer climbs are smooth curves instead of vertical Minecraft blocks.
+ */
+function smoothStepRamp(signedDist, slopeW) {
+  const half = 0.5 * slopeW;
+  if (signedDist <= -half) return 0.0;
+  if (signedDist >= half) return 1.0;
+  const t = (signedDist + half) / slopeW;
+  return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// ==================== Deterministic PRNG & Al Grain Textures ====================
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -256,8 +287,21 @@ function mulberry32(seed) {
   };
 }
 
+/**
+ * Continuous spatial grain height modulation at (x, y) with characteristic wavelength ~ effGrainNm
+ */
+function spatialGrainRelief(x, y, effGrainNm, seed) {
+  const k = (2.0 * Math.PI) / Math.max(4.0, effGrainNm * 2.2);
+  const p1 = seed * 0.17;
+  const p2 = seed * 0.31;
+  const g1 = Math.sin(x * k + p1) * Math.cos(y * k - p2);
+  const g2 = Math.sin((x * 0.866 + y * 0.5) * k * 1.35 - p1) * Math.cos((-x * 0.5 + y * 0.866) * k * 1.35 + p2);
+  const g3 = Math.cos((x * 0.5 - y * 0.866) * k * 1.7 + p2);
+  return 0.45 * g1 + 0.35 * g2 + 0.2 * g3;
+}
+
 function createAlGrainTexture(grainSizeNm, seed = 42) {
-  const size = 128;
+  const size = 256;
   const canvas = document.createElement("canvas");
   canvas.width = size;
   canvas.height = size;
@@ -265,14 +309,14 @@ function createAlGrainTexture(grainSizeNm, seed = 42) {
   const img = ctx.createImageData(size, size);
   const rng = mulberry32(seed);
 
-  // Tileable Voronoi grain centers for realistic polycrystalline Al domes
-  const nSeeds = 36;
+  // Dense Voronoi polycrystalline Al grain domes
+  const nSeeds = 95;
   const pts = [];
   for (let i = 0; i < nSeeds; i++) {
     pts.push({
       x: rng() * size,
       y: rng() * size,
-      facet: 0.85 + 0.3 * rng(),
+      facet: 0.82 + 0.36 * rng(),
     });
   }
 
@@ -284,7 +328,7 @@ function createAlGrainTexture(grainSizeNm, seed = 42) {
         let dy = Math.abs(y - pts[i].y);
         if (dx > size * 0.5) dx = size - dx;
         if (dy > size * 0.5) dy = size - dy;
-        const d = Math.hypot(dx, dy);
+        const d = dx * dx + dy * dy;
         if (d < d1) {
           d2 = d1;
           d1 = d;
@@ -293,9 +337,9 @@ function createAlGrainTexture(grainSizeNm, seed = 42) {
           d2 = d;
         }
       }
-      const ridge = 0.5 * (d2 - d1);
-      const dome = (1.0 - Math.exp(-ridge / 4.2)) * f1;
-      const val = Math.max(0, Math.min(255, Math.floor(dome * 235)));
+      const ridge = 0.5 * (Math.sqrt(d2) - Math.sqrt(d1));
+      const dome = (1.0 - Math.exp(-ridge / 3.2)) * f1;
+      const val = Math.max(0, Math.min(255, Math.floor(dome * 240)));
       const idx = (y * size + x) * 4;
       img.data[idx] = val;
       img.data[idx + 1] = val;
@@ -308,9 +352,6 @@ function createAlGrainTexture(grainSizeNm, seed = 42) {
   const tex = new THREE.CanvasTexture(canvas);
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
-  // Repeat in world space (nm): 6 grains per tile of size (6 * grainSizeNm)
-  const tileWorldNm = Math.max(12.0, 6.0 * grainSizeNm);
-  tex.repeat.set(1.0 / tileWorldNm, 1.0 / tileWorldNm);
   return tex;
 }
 
@@ -320,8 +361,8 @@ const container = document.getElementById("webglContainer");
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0d1117);
 
-const camera = new THREE.PerspectiveCamera(42, 1, 5, 50000);
-camera.up.set(0, 0, 1); // Z is vertical film height (nm)
+const camera = new THREE.PerspectiveCamera(40, 1, 5, 50000);
+camera.up.set(0, 0, 1);
 camera.position.set(1600, -2400, 1800);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
@@ -329,7 +370,7 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.12;
+renderer.toneMappingExposure = 1.15;
 container.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
@@ -337,17 +378,16 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.target.set(600, 400, 30);
 
-// Studio Lighting for Metallic Aluminum Grains
-const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 0.95);
+const hemiLight = new THREE.HemisphereLight(0xe2e8f0, 0x1e293b, 1.0);
 hemiLight.position.set(0, 0, 3000);
 scene.add(hemiLight);
 
-const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.35);
+const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.45);
 dirLight1.position.set(2200, -1800, 2800);
 dirLight1.castShadow = true;
 scene.add(dirLight1);
 
-const dirLight2 = new THREE.DirectionalLight(0x93c5fd, 0.65);
+const dirLight2 = new THREE.DirectionalLight(0x93c5fd, 0.7);
 dirLight2.position.set(-2000, 2200, 1600);
 scene.add(dirLight2);
 
@@ -371,7 +411,349 @@ function animate() {
 }
 animate();
 
-// ==================== 3D Mesh Builders ====================
+// ==================== Smooth Sloped Topographic Surface & 3D Al Grain Builder ====================
+
+function evalStepSmoothDz(px, py, stepObj, slopeW) {
+  const d = signedDistToMultiPoly(px, py, stepObj.footprint);
+  return stepObj.thick * smoothStepRamp(d, slopeW);
+}
+
+function evalPriorGroupsHeight(px, py, priorSteps, slopeW) {
+  let z = 0.0;
+  for (let i = 0; i < priorSteps.length; i++) {
+    z += evalStepSmoothDz(px, py, priorSteps[i], slopeW);
+  }
+  return z;
+}
+
+function evalGroupDz(px, py, groupSteps, slopeW) {
+  let dz = 0.0;
+  for (let i = 0; i < groupSteps.length; i++) {
+    dz += evalStepSmoothDz(px, py, groupSteps[i], slopeW);
+  }
+  return dz;
+}
+
+/**
+ * Builds a smooth, angle-aligned 3D topographic surface mesh + 3D Instanced Al nanograins
+ * for a single layer group. Eliminates vertical 90° Minecraft walls in favor of realistic
+ * C2-smooth sloped edges, smooth conformal step climbs, and visible 3D Al grains.
+ */
+function buildSmoothGroupMeshes(
+  groupName,
+  groupRec,
+  priorSteps,
+  slopeW,
+  roughness,
+  wireframe,
+  seed
+) {
+  const meshes = [];
+  const pal = GROUP_PALETTE[groupName] || GROUP_PALETTE["Custom"];
+  const effGrainNm =
+    groupRec.grainSizes.reduce((a, b) => a + b, 0) / Math.max(1, groupRec.grainSizes.length);
+  const grainTex = createAlGrainTexture(effGrainNm, seed);
+
+  // Dominant orientation angle of this group (e.g. 0° for Electrode 1, 90° for Electrode 2, 45° for Bandage)
+  const domAngleDeg = groupRec.steps.length > 0 ? groupRec.steps[0].rot : 0.0;
+  const rad = (domAngleDeg * Math.PI) / 180.0;
+  const cosA = Math.cos(rad);
+  const sinA = Math.sin(rad);
+
+  const grainPositions = [];
+  const grainNormals = [];
+
+  // Build an angle-aligned smooth surface mesh for each connected polygon in geomUnion
+  for (let pIdx = 0; pIdx < groupRec.geomUnion.length; pIdx++) {
+    const poly = groupRec.geomUnion[pIdx];
+    if (!poly || poly.length === 0) continue;
+
+    // Find tight bounding box in rotated local coordinates (u, v)
+    let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+    for (const [x, y] of poly[0]) {
+      const u = x * cosA + y * sinA;
+      const v = -x * sinA + y * cosA;
+      if (u < uMin) uMin = u;
+      if (u > uMax) uMax = u;
+      if (v < vMin) vMin = v;
+      if (v > vMax) vMax = v;
+    }
+    const margin = slopeW * 0.65 + 8.0;
+    uMin -= margin;
+    uMax += margin;
+    vMin -= margin;
+    vMax += margin;
+
+    const spanU = uMax - uMin;
+    const spanV = vMax - vMin;
+    // Fine grid spacing: ~9 nm along length, ~5 nm across width for silky-smooth sloped ramps
+    const nu = Math.max(32, Math.min(340, Math.ceil(spanU / 9.0)));
+    const nv = Math.max(28, Math.min(200, Math.ceil(spanV / 5.0)));
+    const du = spanU / (nu - 1);
+    const dv = spanV / (nv - 1);
+
+    const nVerts = nu * nv;
+    const positions = new Float32Array(nVerts * 3);
+    const uvs = new Float32Array(nVerts * 2);
+    const dzGrid = new Float32Array(nVerts);
+    const zTopGrid = new Float32Array(nVerts);
+
+    const uvRepeatScale = 1.0 / Math.max(22.0, effGrainNm * 6.5);
+    const grainAmp = roughness * effGrainNm * 0.75;
+
+    for (let i = 0; i < nu; i++) {
+      const u = uMin + i * du;
+      for (let j = 0; j < nv; j++) {
+        const v = vMin + j * dv;
+        const x = u * cosA - v * sinA;
+        const y = u * sinA + v * cosA;
+        const idx = i * nv + j;
+
+        const zBot = evalPriorGroupsHeight(x, y, priorSteps, slopeW);
+        const dz = evalGroupDz(x, y, groupRec.stepObjs, slopeW);
+        dzGrid[idx] = dz;
+
+        // Attenuate grain ripple smoothly to 0 at the bottom toe so the film edge seals flush onto zBot
+        const env = Math.min(1.0, dz / 5.0);
+        const gRipple = grainAmp * env * spatialGrainRelief(x, y, effGrainNm, seed + pIdx * 19);
+        const zTop = dz > 0.03 ? zBot + dz + gRipple : Math.max(0.0, zBot - 0.12);
+        zTopGrid[idx] = zTop;
+
+        positions[idx * 3] = x;
+        positions[idx * 3 + 1] = y;
+        positions[idx * 3 + 2] = zTop;
+
+        uvs[idx * 2] = u * uvRepeatScale;
+        uvs[idx * 2 + 1] = v * uvRepeatScale;
+      }
+    }
+
+    // Emit triangles for all active cells
+    const indices = [];
+    for (let i = 0; i < nu - 1; i++) {
+      for (let j = 0; j < nv - 1; j++) {
+        const i00 = i * nv + j;
+        const i10 = (i + 1) * nv + j;
+        const i01 = i * nv + (j + 1);
+        const i11 = (i + 1) * nv + (j + 1);
+
+        if (
+          dzGrid[i00] > 0.06 ||
+          dzGrid[i10] > 0.06 ||
+          dzGrid[i01] > 0.06 ||
+          dzGrid[i11] > 0.06
+        ) {
+          indices.push(i00, i10, i11);
+          indices.push(i00, i11, i01);
+        }
+      }
+    }
+
+    if (indices.length === 0) continue;
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geom.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+    geom.setIndex(indices);
+    geom.computeVertexNormals();
+
+    const mat = new THREE.MeshStandardMaterial({
+      color: pal.hex,
+      metalness: 0.58,
+      roughness: 0.42,
+      bumpMap: grainTex,
+      bumpScale: Math.max(0.35, roughness * effGrainNm * 0.42),
+      wireframe,
+      side: THREE.DoubleSide,
+    });
+
+    const surfMesh = new THREE.Mesh(geom, mat);
+    surfMesh.castShadow = true;
+    surfMesh.receiveShadow = true;
+    meshes.push(surfMesh);
+
+    // Uniform jittered lattice sampling for tightly-packed, subtle 3D Al nanograins (no sparse droplet look)
+    const normalsAttr = geom.attributes.normal;
+    const rng = mulberry32(seed + pIdx * 71);
+    const stepI = Math.max(1, Math.round(11.0 / du));
+    const stepJ = Math.max(1, Math.round(11.0 / dv));
+    for (let i = 1; i < nu - 1; i += stepI) {
+      for (let j = 1; j < nv - 1; j += stepJ) {
+        const vIdx = i * nv + j;
+        if (dzGrid[vIdx] > 1.2) {
+          grainPositions.push(
+            positions[vIdx * 3] + (rng() - 0.5) * du * 0.85,
+            positions[vIdx * 3 + 1] + (rng() - 0.5) * dv * 0.85,
+            positions[vIdx * 3 + 2] - 0.25
+          );
+          grainNormals.push(
+            normalsAttr.getX(vIdx),
+            normalsAttr.getY(vIdx),
+            normalsAttr.getZ(vIdx)
+          );
+        }
+      }
+    }
+  }
+
+  // Create subtle, tightly-packed 3D Instanced Aluminum Nanograins across the sloped film surface
+  if (!wireframe && grainPositions.length > 0) {
+    const nGrains = grainPositions.length / 3;
+    const xyRadius = Math.max(4.5, effGrainNm * 1.05);
+    const zRadius = Math.max(0.9, effGrainNm * (0.16 + 0.22 * roughness));
+
+    const pebbleGeom = new THREE.IcosahedronGeometry(1.0, 1);
+    pebbleGeom.scale(xyRadius, xyRadius, zRadius);
+
+    const pebbleMat = new THREE.MeshStandardMaterial({
+      color: pal.hex,
+      metalness: 0.62,
+      roughness: 0.38,
+    });
+
+    const instMesh = new THREE.InstancedMesh(pebbleGeom, pebbleMat, nGrains);
+    instMesh.castShadow = false;
+    instMesh.receiveShadow = true;
+
+    const dummy = new THREE.Object3D();
+    const upVec = new THREE.Vector3(0, 0, 1);
+    const normVec = new THREE.Vector3();
+    const baseColor = new THREE.Color(pal.hex);
+    const instColor = new THREE.Color();
+    const rng = mulberry32(seed + 999);
+
+    for (let k = 0; k < nGrains; k++) {
+      const gx = grainPositions[k * 3];
+      const gy = grainPositions[k * 3 + 1];
+      const gz = grainPositions[k * 3 + 2];
+
+      normVec.set(
+        grainNormals[k * 3],
+        grainNormals[k * 3 + 1],
+        Math.max(0.25, grainNormals[k * 3 + 2])
+      ).normalize();
+
+      dummy.position.set(gx, gy, gz);
+      dummy.quaternion.setFromUnitVectors(upVec, normVec);
+      dummy.rotateZ(rng() * Math.PI * 2);
+      const sxy = 0.82 + 0.38 * rng();
+      const sz = 0.8 + 0.4 * rng();
+      dummy.scale.set(sxy, sxy, sz);
+      dummy.updateMatrix();
+      instMesh.setMatrixAt(k, dummy.matrix);
+
+      const shade = 0.94 + 0.12 * rng();
+      instColor.copy(baseColor).multiplyScalar(shade);
+      instMesh.setColorAt(k, instColor);
+    }
+    instMesh.instanceMatrix.needsUpdate = true;
+    if (instMesh.instanceColor) instMesh.instanceColor.needsUpdate = true;
+    meshes.push(instMesh);
+  }
+
+  return meshes;
+}
+
+// ==================== Main Simulation Engine ====================
+
+function runSimulation() {
+  if (!state.rawPolygons || state.rawPolygons.length === 0) return;
+
+  const hBot = Math.max(10, parseFloat(document.getElementById("inpHBot").value) || 400);
+  const tTop = Math.max(0, parseFloat(document.getElementById("inpTTop").value) || 280);
+  const undercut = Math.max(0, parseFloat(document.getElementById("inpUndercut").value) || 200);
+  const d0Grain = Math.max(1.0, parseFloat(document.getElementById("inpGrainSize").value) || 5.0);
+  const roughness = Math.max(0.0, Math.min(0.8, parseFloat(document.getElementById("inpRoughness").value) || 0.25));
+  const clogging = document.getElementById("chkClogging").checked;
+
+  // Physical penumbra & adatom diffusion slope width (nm) for smooth sloped edges
+  const slopeW = 46.0;
+
+  // 1. Union input GDS polygons into topMask
+  const inputPolys = state.rawPolygons.map((ring) => [[ring]]);
+  const topMask = polygonClipping.union(...inputPolys);
+  const cavity = expandMultiPolygon(topMask, undercut);
+
+  const bounds = multiPolyBounds(cavity);
+  const pad = 250;
+  const subMinX = bounds.minX - pad;
+  const subMinY = bounds.minY - pad;
+  const subMaxX = bounds.maxX + pad;
+  const subMaxY = bounds.maxY + pad;
+  const substrateMultiPoly = [[makeBoxRing(subMinX, subMinY, subMaxX, subMaxY)]];
+
+  let effectiveMask = topMask;
+  const groupOrder = [];
+  const groupRecords = {};
+  const allStepObjs = [];
+
+  state.steps.forEach((step, sIdx) => {
+    const thick = parseFloat(step.thick) || 0;
+    if (thick <= 0) return;
+    const grp = step.group || "Custom";
+    const tilt = parseFloat(step.tilt) || 0;
+    const rot = parseFloat(step.rot) || 0;
+    const rate = Math.max(0.05, parseFloat(step.rate) || 1.0);
+
+    const effGrainNm = d0Grain * Math.pow(thick / 30.0, 0.3) * Math.pow(1.0 / rate, 0.2);
+    const footprint = computeStepShadowFootprint(effectiveMask, cavity, hBot, tTop, tilt, rot, 9);
+    if (!footprint || footprint.length === 0) return;
+
+    const stepObj = {
+      group: grp,
+      tilt,
+      rot,
+      thick,
+      rate,
+      oxidize: Boolean(step.oxidize),
+      effGrainNm,
+      footprint,
+      seed: 300 + sIdx * 53,
+    };
+    allStepObjs.push(stepObj);
+
+    if (!groupRecords[grp]) {
+      groupOrder.push(grp);
+      groupRecords[grp] = {
+        geomUnion: footprint,
+        grainSizes: [effGrainNm],
+        steps: [step],
+        stepObjs: [stepObj],
+      };
+    } else {
+      groupRecords[grp].geomUnion = polygonClipping.union(groupRecords[grp].geomUnion, footprint);
+      groupRecords[grp].grainSizes.push(effGrainNm);
+      groupRecords[grp].steps.push(step);
+      groupRecords[grp].stepObjs.push(stepObj);
+    }
+
+    if (clogging) {
+      const clogNm = 0.25 * thick * Math.sin((Math.abs(tilt) * Math.PI) / 180.0);
+      if (clogNm > 0.2) {
+        const eroded = erodeMultiPolygon(effectiveMask, clogNm);
+        if (eroded && eroded.length > 0) effectiveMask = eroded;
+      }
+    }
+  });
+
+  state.lastSim = {
+    topMask,
+    cavity,
+    substrateBounds: { minX: subMinX, minY: subMinY, maxX: subMaxX, maxY: subMaxY },
+    substrateMultiPoly,
+    hBot,
+    tTop,
+    roughness,
+    slopeW,
+    allStepObjs,
+    groupOrder,
+    groupRecords,
+  };
+
+  rebuildWebGLScene();
+  draw2DAndCutCanvases();
+  updateMetricsBox();
+}
 
 function multiPolyToThreeShapes(multiPoly) {
   const shapes = [];
@@ -401,187 +783,6 @@ function multiPolyToThreeShapes(multiPoly) {
   return shapes;
 }
 
-function buildConformalBlockMesh(multiPoly, zBot, zTop, groupName, effGrainNm, roughnessFactor, seed, wireframe) {
-  const height = zTop - zBot;
-  if (height <= 0.05) return null;
-  const shapes = multiPolyToThreeShapes(multiPoly);
-  if (shapes.length === 0) return null;
-
-  const geom = new THREE.ExtrudeGeometry(shapes, {
-    depth: height,
-    bevelEnabled: false,
-    steps: 1,
-  });
-
-  // Displace top-face vertices slightly with grain relief while keeping bottom face strictly flush at zBot
-  const pos = geom.attributes.position;
-  const rng = mulberry32(seed);
-  const amp = roughnessFactor * effGrainNm;
-  for (let i = 0; i < pos.count; i++) {
-    const zLocal = pos.getZ(i);
-    if (Math.abs(zLocal - height) < 0.05) {
-      const dz = (rng() - 0.5) * amp;
-      pos.setZ(i, zBot + height + dz);
-    } else {
-      pos.setZ(i, zBot + zLocal);
-    }
-  }
-  pos.needsUpdate = true;
-  geom.computeVertexNormals();
-
-  const pal = GROUP_PALETTE[groupName] || GROUP_PALETTE["Custom"];
-  const grainTex = createAlGrainTexture(effGrainNm, seed);
-
-  const mat = new THREE.MeshStandardMaterial({
-    color: pal.hex,
-    metalness: 0.62,
-    roughness: 0.34,
-    bumpMap: grainTex,
-    bumpScale: Math.max(0.3, roughnessFactor * effGrainNm * 0.45),
-    wireframe: wireframe,
-    polygonOffset: true,
-    polygonOffsetFactor: 1,
-    polygonOffsetUnits: 1,
-  });
-
-  const mesh = new THREE.Mesh(geom, mat);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
-
-  // Crisp subtle edge lines so individual step terraces and junction overlaps are clearly delineated
-  if (!wireframe) {
-    const edgesGeom = new THREE.EdgesGeometry(geom, 28);
-    const edgesMat = new THREE.LineBasicMaterial({
-      color: 0x0b0f19,
-      transparent: true,
-      opacity: 0.38,
-    });
-    mesh.add(new THREE.LineSegments(edgesGeom, edgesMat));
-  }
-
-  return mesh;
-}
-
-// ==================== Main Simulation Engine ====================
-
-function runSimulation() {
-  if (!state.rawPolygons || state.rawPolygons.length === 0) return;
-
-  const hBot = Math.max(10, parseFloat(document.getElementById("inpHBot").value) || 400);
-  const tTop = Math.max(0, parseFloat(document.getElementById("inpTTop").value) || 280);
-  const undercut = Math.max(0, parseFloat(document.getElementById("inpUndercut").value) || 200);
-  const d0Grain = Math.max(1.0, parseFloat(document.getElementById("inpGrainSize").value) || 5.0);
-  const roughness = Math.max(0.0, Math.min(0.8, parseFloat(document.getElementById("inpRoughness").value) || 0.25));
-  const clogging = document.getElementById("chkClogging").checked;
-
-  // 1. Union input GDS polygons into topMask
-  const inputPolys = state.rawPolygons.map((ring) => [[ring]]);
-  const topMask = polygonClipping.union(...inputPolys);
-  const cavity = expandMultiPolygon(topMask, undercut);
-
-  const bounds = multiPolyBounds(cavity);
-  const pad = 250;
-  const subMinX = bounds.minX - pad;
-  const subMinY = bounds.minY - pad;
-  const subMaxX = bounds.maxX + pad;
-  const subMaxY = bounds.maxY + pad;
-  const substrateMultiPoly = [[makeBoxRing(subMinX, subMinY, subMaxX, subMaxY)]];
-
-  // 2. Exact Polygonal Conformal Stacking
-  let heightRegions = [{ geom: substrateMultiPoly, zCurr: 0.0 }];
-  let effectiveMask = topMask;
-
-  const conformalBlocks = [];
-  const oxideBlocks = [];
-  const groupOrder = [];
-  const groupRecords = {};
-
-  state.steps.forEach((step, sIdx) => {
-    const thick = parseFloat(step.thick) || 0;
-    if (thick <= 0) return;
-    const grp = step.group || "Custom";
-    const tilt = parseFloat(step.tilt) || 0;
-    const rot = parseFloat(step.rot) || 0;
-    const rate = Math.max(0.05, parseFloat(step.rate) || 1.0);
-
-    // Effective Al grain size scales around nominal grain size @ 1 nm/s, 30 nm thickness
-    const effGrainNm = d0Grain * Math.pow(thick / 30.0, 0.3) * Math.pow(1.0 / rate, 0.2);
-
-    const footprint = computeStepShadowFootprint(effectiveMask, cavity, hBot, tTop, tilt, rot, 9);
-    if (!footprint || footprint.length === 0) return;
-
-    const oxAdd = step.oxidize ? 1.5 : 0.0;
-    const nextRegions = [];
-
-    for (const reg of heightRegions) {
-      const hit = polygonClipping.intersection(reg.geom, footprint);
-      const miss = polygonClipping.difference(reg.geom, footprint);
-
-      if (hit && hit.length > 0 && multiPolyArea(hit) > 0.5) {
-        conformalBlocks.push({
-          group: grp,
-          geom: hit,
-          zBot: reg.zCurr,
-          zTop: reg.zCurr + thick,
-          effGrainNm,
-          seed: 300 + sIdx * 53,
-        });
-        if (step.oxidize) {
-          oxideBlocks.push({
-            geom: hit,
-            zBot: reg.zCurr + thick,
-            zTop: reg.zCurr + thick + oxAdd,
-          });
-        }
-        nextRegions.push({ geom: hit, zCurr: reg.zCurr + thick + oxAdd });
-      }
-      if (miss && miss.length > 0 && multiPolyArea(miss) > 0.5) {
-        nextRegions.push({ geom: miss, zCurr: reg.zCurr });
-      }
-    }
-    heightRegions = nextRegions;
-
-    if (!groupRecords[grp]) {
-      groupOrder.push(grp);
-      groupRecords[grp] = {
-        geomUnion: footprint,
-        grainSizes: [effGrainNm],
-        steps: [step],
-      };
-    } else {
-      groupRecords[grp].geomUnion = polygonClipping.union(groupRecords[grp].geomUnion, footprint);
-      groupRecords[grp].grainSizes.push(effGrainNm);
-      groupRecords[grp].steps.push(step);
-    }
-
-    if (clogging) {
-      const clogNm = 0.25 * thick * Math.sin((Math.abs(tilt) * Math.PI) / 180.0);
-      if (clogNm > 0.2) {
-        const eroded = erodeMultiPolygon(effectiveMask, clogNm);
-        if (eroded && eroded.length > 0) effectiveMask = eroded;
-      }
-    }
-  });
-
-  state.lastSim = {
-    topMask,
-    cavity,
-    substrateBounds: { minX: subMinX, minY: subMinY, maxX: subMaxX, maxY: subMaxY },
-    substrateMultiPoly,
-    hBot,
-    tTop,
-    roughness,
-    conformalBlocks,
-    oxideBlocks,
-    groupOrder,
-    groupRecords,
-  };
-
-  rebuildWebGLScene();
-  draw2DAndCutCanvases();
-  updateMetricsBox();
-}
-
 function rebuildWebGLScene() {
   while (simGroup.children.length > 0) {
     const child = simGroup.children.pop();
@@ -597,8 +798,9 @@ function rebuildWebGLScene() {
     hBot,
     tTop,
     roughness,
-    conformalBlocks,
-    oxideBlocks,
+    slopeW,
+    groupOrder,
+    groupRecords,
   } = state.lastSim;
 
   const showResist = document.getElementById("chkShowResist").checked;
@@ -613,9 +815,9 @@ function rebuildWebGLScene() {
   const subGeom = new THREE.ExtrudeGeometry(subShapes, { depth: 18, bevelEnabled: false });
   subGeom.translate(0, 0, -18);
   const subMat = new THREE.MeshStandardMaterial({
-    color: 0x1e242c,
-    metalness: 0.2,
-    roughness: 0.75,
+    color: 0x181d24,
+    metalness: 0.18,
+    roughness: 0.78,
     wireframe,
   });
   const subMesh = new THREE.Mesh(subGeom, subMat);
@@ -626,50 +828,33 @@ function rebuildWebGLScene() {
   const cx = 0.5 * (substrateBounds.minX + substrateBounds.maxX);
   const cy = 0.5 * (substrateBounds.minY + substrateBounds.maxY);
   const span = Math.max(substrateBounds.maxX - substrateBounds.minX, substrateBounds.maxY - substrateBounds.minY);
-  const grid = new THREE.GridHelper(span, 20, 0x30363d, 0x21262d);
+  const grid = new THREE.GridHelper(span, 20, 0x2a3038, 0x1d222a);
   grid.rotation.x = Math.PI / 2;
-  grid.position.set(cx, cy, 0.2);
+  grid.position.set(cx, cy, 0.1);
   simGroup.add(grid);
 
-  // 2. Conformal Aluminum Layer Blocks (Flush zBot -> zTop)
-  for (const blk of conformalBlocks) {
-    const mesh = buildConformalBlockMesh(
-      blk.geom,
-      blk.zBot,
-      blk.zTop,
-      blk.group,
-      blk.effGrainNm,
+  // 2. Smooth Sloped Conformal Aluminum Layers + 3D Instanced Al Nanograins
+  const priorSteps = [];
+  groupOrder.forEach((grp, gIdx) => {
+    const rec = groupRecords[grp];
+    const gMeshes = buildSmoothGroupMeshes(
+      grp,
+      rec,
+      priorSteps,
+      slopeW,
       roughness,
-      blk.seed,
-      wireframe
+      wireframe,
+      400 + gIdx * 131
     );
-    if (mesh) simGroup.add(mesh);
-  }
+    for (const m of gMeshes) simGroup.add(m);
+    priorSteps.push(...rec.stepObjs);
+  });
 
-  // 3. AlOx Oxide Barrier Layers
-  for (const ox of oxideBlocks) {
-    const oxShapes = multiPolyToThreeShapes(ox.geom);
-    if (oxShapes.length === 0) continue;
-    const oxGeom = new THREE.ExtrudeGeometry(oxShapes, {
-      depth: ox.zTop - ox.zBot,
-      bevelEnabled: false,
-    });
-    oxGeom.translate(0, 0, ox.zBot);
-    const oxMat = new THREE.MeshStandardMaterial({
-      color: 0xf2cc60,
-      transparent: true,
-      opacity: 0.75,
-      roughness: 0.4,
-      metalness: 0.1,
-    });
-    simGroup.add(new THREE.Mesh(oxGeom, oxMat));
-  }
-
-  // 4. Undercut Cavity Outline on Substrate
+  // 3. Undercut Cavity Outline on Substrate
   if (showCavity) {
     for (const poly of cavity) {
       for (const ring of poly) {
-        const pts = ring.map(([x, y]) => new THREE.Vector3(x, y, 0.8));
+        const pts = ring.map(([x, y]) => new THREE.Vector3(x, y, 0.6));
         pts.push(pts[0].clone());
         const lineGeom = new THREE.BufferGeometry().setFromPoints(pts);
         const lineMat = new THREE.LineDashedMaterial({
@@ -684,7 +869,7 @@ function rebuildWebGLScene() {
     }
   }
 
-  // 5. Optional Translucent Top Resist Mask at [hBot, hBot + tTop]
+  // 4. Optional Translucent Top Resist Mask at [hBot, hBot + tTop]
   if (showResist && tTop > 0) {
     const resistMultiPoly = polygonClipping.difference(substrateMultiPoly, topMask);
     const resShapes = multiPolyToThreeShapes(resistMultiPoly);
@@ -703,7 +888,7 @@ function rebuildWebGLScene() {
   }
 }
 
-// ==================== 2D Top-Down & Cross-Section Canvas Renderers ====================
+// ==================== 2D Top-Down & Smooth Cross-Section Canvas Renderers ====================
 
 function draw2DAndCutCanvases() {
   if (!state.lastSim) return;
@@ -749,7 +934,6 @@ function draw2DCanvas() {
     }
   }
 
-  // Draw deposited groups
   for (const grp of groupOrder) {
     const rec = groupRecords[grp];
     const pal = GROUP_PALETTE[grp] || GROUP_PALETTE["Custom"];
@@ -761,7 +945,6 @@ function draw2DCanvas() {
     ctx.stroke();
   }
 
-  // Draw undercut cavity (dashed)
   ctx.save();
   ctx.setLineDash([4, 3]);
   traceMultiPoly(cavity);
@@ -770,13 +953,11 @@ function draw2DCanvas() {
   ctx.stroke();
   ctx.restore();
 
-  // Draw top mask opening (crisp white)
   traceMultiPoly(topMask);
   ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
   ctx.lineWidth = 1.1;
   ctx.stroke();
 
-  // Draw yellow cross-section line cut indicator
   const cutAxis = document.getElementById("selCutAxis").value;
   ctx.save();
   ctx.setLineDash([6, 3]);
@@ -822,10 +1003,10 @@ function drawCutCanvas() {
   ctx.fillStyle = "#0d1117";
   ctx.fillRect(0, 0, w, h);
 
-  const { substrateBounds, conformalBlocks, roughness, groupOrder } = state.lastSim;
+  const { substrateBounds, groupOrder, groupRecords, slopeW, roughness } = state.lastSim;
   const cutAxis = document.getElementById("selCutAxis").value;
 
-  const nSamples = 320;
+  const nSamples = 360;
   let sMin, sMax;
   if (cutAxis === "X" || cutAxis === "B2") {
     sMin = substrateBounds.minX;
@@ -835,12 +1016,45 @@ function drawCutCanvas() {
     sMax = substrateBounds.maxY;
   }
 
-  let maxZ = 60.0;
-  for (const b of conformalBlocks) {
-    if (b.zTop > maxZ) maxZ = b.zTop;
-  }
-  maxZ *= 1.25;
+  // Evaluate smooth cumulative profiles along the cut line
+  const sArr = new Float32Array(nSamples);
+  const zCumulative = new Float32Array(nSamples);
+  const groupProfiles = [];
 
+  for (let i = 0; i < nSamples; i++) {
+    sArr[i] = sMin + ((sMax - sMin) * i) / (nSamples - 1);
+  }
+
+  let maxZ = 60.0;
+  groupOrder.forEach((grp, gIdx) => {
+    const rec = groupRecords[grp];
+    const effG = rec.grainSizes.reduce((a, b) => a + b, 0) / Math.max(1, rec.grainSizes.length);
+    const amp = roughness * effG * 0.9;
+    const zBotArr = new Float32Array(zCumulative);
+    const zTopArr = new Float32Array(nSamples);
+    const dzArr = new Float32Array(nSamples);
+
+    for (let i = 0; i < nSamples; i++) {
+      const s = sArr[i];
+      let px = 0, py = 0;
+      if (cutAxis === "X") { px = s; py = 0; }
+      else if (cutAxis === "Y") { px = 0; py = s; }
+      else if (cutAxis === "B1") { px = 2900; py = s; }
+      else { px = s; py = 2150; }
+
+      const dz = evalGroupDz(px, py, rec.stepObjs, slopeW);
+      dzArr[i] = dz;
+      const env = Math.min(1.0, dz / 4.0);
+      const gRipple = amp * env * spatialGrainRelief(px, py, effG, 500 + gIdx * 37);
+      const zt = zBotArr[i] + dz + (dz > 0.05 ? gRipple : 0.0);
+      zTopArr[i] = zt;
+      zCumulative[i] = zt;
+      if (zt > maxZ) maxZ = zt;
+    }
+    groupProfiles.push({ grp, zBotArr, zTopArr, dzArr });
+  });
+
+  maxZ *= 1.25;
   const padL = 42, padR = 16, padT = 14, padB = 26;
   const plotW = Math.max(50, w - padL - padR);
   const plotH = Math.max(40, h - padT - padB);
@@ -848,7 +1062,6 @@ function drawCutCanvas() {
   const toX = (s) => padL + ((s - sMin) / (sMax - sMin || 1)) * plotW;
   const toY = (z) => padT + plotH - (z / maxZ) * plotH;
 
-  // Grid lines & axes
   ctx.strokeStyle = "#21262d";
   ctx.lineWidth = 1;
   ctx.fillStyle = "#8b949e";
@@ -863,62 +1076,49 @@ function drawCutCanvas() {
     ctx.fillText(`${Math.round(zVal)}`, 8, py + 3);
   }
 
-  // Sample conformal blocks along cut line
-  for (const blk of conformalBlocks) {
-    const pal = GROUP_PALETTE[blk.group] || GROUP_PALETTE["Custom"];
-    const rng = mulberry32(blk.seed + 17);
-    const amp = roughness * blk.effGrainNm;
-
+  for (const prof of groupProfiles) {
+    const pal = GROUP_PALETTE[prof.grp] || GROUP_PALETTE["Custom"];
     let inSeg = false;
-    let segPtsTop = [];
-    let segPtsBot = [];
+    let topPts = [];
+    let botPts = [];
 
-    const flushSegment = () => {
-      if (segPtsTop.length < 2) {
-        segPtsTop = [];
-        segPtsBot = [];
+    const flush = () => {
+      if (topPts.length < 2) {
+        topPts = [];
+        botPts = [];
         return;
       }
       ctx.beginPath();
-      segPtsTop.forEach(([sx, sy], idx) => {
+      topPts.forEach(([sx, sy], idx) => {
         if (idx === 0) ctx.moveTo(sx, sy);
         else ctx.lineTo(sx, sy);
       });
-      for (let i = segPtsBot.length - 1; i >= 0; i--) {
-        ctx.lineTo(segPtsBot[i][0], segPtsBot[i][1]);
+      for (let i = botPts.length - 1; i >= 0; i--) {
+        ctx.lineTo(botPts[i][0], botPts[i][1]);
       }
       ctx.closePath();
       ctx.fillStyle = pal.rgba;
       ctx.fill();
       ctx.strokeStyle = pal.css;
-      ctx.lineWidth = 1.3;
+      ctx.lineWidth = 1.4;
       ctx.stroke();
-      segPtsTop = [];
-      segPtsBot = [];
+      topPts = [];
+      botPts = [];
     };
 
     for (let i = 0; i < nSamples; i++) {
-      const s = sMin + ((sMax - sMin) * i) / (nSamples - 1);
-      let px = 0, py = 0;
-      if (cutAxis === "X") { px = s; py = 0; }
-      else if (cutAxis === "Y") { px = 0; py = s; }
-      else if (cutAxis === "B1") { px = 2900; py = s; }
-      else { px = s; py = 2150; }
-
-      if (pointInMultiPoly(px, py, blk.geom)) {
-        const dzGrain = (rng() - 0.5) * amp;
-        segPtsTop.push([toX(s), toY(blk.zTop + dzGrain)]);
-        segPtsBot.push([toX(s), toY(blk.zBot)]);
+      if (prof.dzArr[i] > 0.08) {
+        topPts.push([toX(sArr[i]), toY(prof.zTopArr[i])]);
+        botPts.push([toX(sArr[i]), toY(prof.zBotArr[i])]);
         inSeg = true;
       } else if (inSeg) {
-        flushSegment();
+        flush();
         inSeg = false;
       }
     }
-    if (inSeg) flushSegment();
+    if (inSeg) flush();
   }
 
-  // X-axis ticks
   const nTicks = 5;
   for (let k = 0; k <= nTicks; k++) {
     const sVal = sMin + ((sMax - sMin) * k) / nTicks;
@@ -983,7 +1183,6 @@ function updateMetricsBox() {
 function generateManhattanLayout(withBandages = true) {
   const rings = [];
   if (withBandages) {
-    // Extended orthogonal Manhattan fingers + 2000 nm 45-deg bandage channels at lead ends
     rings.push(makeBoxRing(-1100, -80, 3300, 80));
     rings.push(makeBoxRing(-80, -1100, 80, 2600));
     const bSlot = makeBoxRing(-1000, -80, 1000, 80);
@@ -1232,7 +1431,6 @@ document.getElementById("selCutAxis").addEventListener("change", draw2DAndCutCan
   document.getElementById(id).addEventListener("change", rebuildWebGLScene);
 });
 
-// File Browse (Electron native dialog or fallback HTML5 file input)
 document.getElementById("btnBrowseGds").addEventListener("click", async () => {
   if (window.electronAPI && window.electronAPI.openGdsDialog) {
     const res = await window.electronAPI.openGdsDialog();
